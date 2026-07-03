@@ -180,6 +180,77 @@ POST /reconcile  { scope, key, request_hash }
 
 Redis (cache / rate limit) and Kafka (events / audit) are optional deployment plumbing, not correctness. Correctness rests on Postgres.
 
+## Extensions — how Rekey stands apart
+
+Four directions that turn "another idempotency library" into a distinct product. They compose into one story: *a gateway that guarantees a dangerous action — triggered by a human or an AI agent — runs exactly once, and shows you what happened.*
+
+### 1. Proxy mode — kill the `/reconcile` burden
+
+The weakest point of the coordination model is that every protected service must implement `/reconcile`. Proxy mode removes it: instead of *coordinating* the operation, Rekey *executes* it.
+
+```
+client -> Rekey (proxy) -> downstream service
+
+1. Client sends POST /orders with Idempotency-Key to Rekey, not to the backend.
+2. Rekey reserves the key internally (same table, same UNIQUE constraint).
+3. decision=new     -> Rekey forwards the request downstream itself,
+                       saves the response, marks the key completed, returns it.
+   decision=replay  -> Rekey returns the saved response; downstream never called.
+4. If Rekey crashes mid-call, it retries the downstream call itself on restart --
+   it made the call, so it owns the outcome. No reconcile endpoint needed.
+```
+
+Integration cost drops to zero: point traffic at Rekey (standalone reverse proxy, sidecar, or Envoy/Kong plugin) and everything behind it is protected. The extra network hop disappears in the sidecar/plugin form. The original API mode stays available for callers that need in-process control.
+
+### 2. Side-effect firewall for AI agents
+
+In practice the biggest source of duplicated actions is no longer network retries — it is agents: an LLM repeats a tool call, retries after a timeout, or two parallel agents perform the same action. The core engine already solves this; this extension repackages it for that caller.
+
+```
+agent -> MCP tool call "send_email" -> Rekey firewall -> actual tool
+
+1. Rekey derives the key: hash(agent_id, tool, canonicalized args).
+2. decision=new     -> execute the tool, record the result.
+   decision=replay  -> return the recorded result; the email is NOT sent twice.
+3. Policy layer (optional): operations matching a rule (amount > X,
+   destructive scope) are held in `pending_approval` until a human confirms.
+4. Every call lands in an audit journal: which agent did what, when, with what args.
+```
+
+Deliverable: an MCP-compatible gateway + audit log + approval gate. Same table, same state machine — `pending_approval` is just one more status before `processing`.
+
+### 3. Inbound webhook deduplication — the adoption wedge
+
+The mirror image of the same problem: providers (Stripe, GitHub, Telegram) deliver webhooks *at-least-once*, and every team hand-writes the same dedup. Rekey terminates webhooks instead:
+
+```
+provider -> Rekey /webhooks/{tenant}/{source} -> your handler
+
+1. Rekey verifies the provider signature.
+2. Reserves key = (tenant, source, event_id) -- the same Reserve call.
+3. decision=new    -> forward the event to your handler exactly once;
+                      retry with backoff until the handler returns 2xx.
+   decision=replay -> drop the duplicate silently.
+```
+
+Small, well-understood pain; near-zero integration cost. It gets Rekey into the stack, after which the core product is already deployed.
+
+### 4. Observability as a product, not a metrics endpoint
+
+Rekey sits on data no one else has: every prevented duplicate is money not charged twice. Surface it instead of only exporting counters:
+
+```
+- prevented duplicates per scope/tenant, with the monetary amount when the
+  request body carries one ("prevented 214 double charges / $18,340 this month")
+- stuck-operation heatmap: which downstream service leaves keys in
+  reconcile_required, how often, how long recovery takes
+- per-tenant retry patterns: which client retries pathologically
+```
+
+Logic: everything is derived from the existing `idempotency_keys` table plus a small events table written on each state transition — no new infrastructure. A dashboard that states its value in currency justifies the service to the business by itself.
+
+**Non-goal:** sagas / multi-step workflow chains. That is Temporal/Restate territory; entering it sacrifices the simplicity that is Rekey's advantage over them.
+
 ## Correctness check
 
 The key test: 100 concurrent `Reserve` calls with the same key must yield exactly **one** `decision=new`; the rest must be `processing` or `replay`.
